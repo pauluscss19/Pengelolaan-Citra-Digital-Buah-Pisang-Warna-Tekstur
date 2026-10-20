@@ -18,7 +18,7 @@ from src.model_training import load_trained_model
 def predict_image(
     image_path: str,
     experiment_id: int,
-    use_segmentation: bool = False,
+    use_segmentation: Optional[bool] = None,
 ) -> Optional[Dict]:
     """
     Prediksi tingkat kematangan dari satu gambar menggunakan model terlatih.
@@ -26,7 +26,7 @@ def predict_image(
     Args:
         image_path: path gambar input
         experiment_id: ID eksperimen (1-6)
-        use_segmentation: gunakan GrabCut
+        use_segmentation: gunakan GrabCut (None = ikuti konfigurasi model saat training)
     
     Returns:
         Dict berisi prediksi, fitur, dan informasi preprocessing.
@@ -50,8 +50,8 @@ def predict_image(
     feature_names = model_info['feature_names']
     model_seg = model_info.get('use_segmentation', False)
     
-    # Gunakan setting segmentasi yang sama dengan saat training
-    effective_seg = model_seg
+    # Gunakan setting segmentasi yang diberikan atau fallback ke saat training
+    effective_seg = model_seg if use_segmentation is None else use_segmentation
     
     # Preprocessing
     preprocessed = preprocess_image(image_path, use_segmentation=effective_seg)
@@ -111,13 +111,14 @@ def predict_image(
         'classes': model_info['classes'],
         'preprocessed': preprocessed,
         'use_segmentation': effective_seg,
+        'model_seg_trained': model_seg,
         'n_features': len(features),
     }
 
 
 def predict_all_models(
     image_path: str,
-    use_segmentation: bool = False,
+    use_segmentation: Optional[bool] = None,
 ) -> Dict[int, Dict]:
     """
     Prediksi menggunakan semua model yang tersedia.

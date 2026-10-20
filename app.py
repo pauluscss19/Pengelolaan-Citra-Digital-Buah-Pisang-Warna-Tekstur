@@ -23,7 +23,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from config import (
     DEFAULT_DATASET_PATH, TARGET_SIZE, HISTOGRAM_BINS,
-    GLCM_GRAY_LEVELS, GLCM_DISTANCES, GLCM_ANGLES_DEG, GLCM_PROPERTIES,
+    GLCM_GRAY_LEVELS, GLCM_DISTANCES, GLCM_ANGLES_DEG, GLCM_PROPERTIES, GLCM_RESIZE,
     SVM_KERNEL, SVM_C, SVM_GAMMA, SVM_CLASS_WEIGHT,
     QUICK_MODE_SAMPLES_PER_CLASS, RANDOM_SEED,
     EXPERIMENT_NAMES, EXPERIMENT_COLOR_SPACES, EXPERIMENT_USE_GLCM,
@@ -37,7 +37,7 @@ from src.dataset_loader import (
 )
 from src.preprocessing import (
     preprocess_image, read_image, resize_image, convert_color_space,
-    segment_foreground,
+    segment_foreground, apply_mask,
 )
 from src.feature_extraction import (
     extract_all_features, extract_color_features,
@@ -875,9 +875,10 @@ elif page == "📊 Evaluasi":
 
 
 # ==================== HALAMAN PREDIKSI ====================
+# ==================== HALAMAN PREDIKSI ====================
 elif page == "🔮 Prediksi":
-    show_header("Prediksi Gambar Baru",
-                "Unggah Gambar Pisang dan Dapatkan Prediksi Tingkat Kematangan")
+    show_header("Prediksi & Pipeline Pemrosesan Citra Digital",
+                "Visualisasi Lengkap Preprocessing (Segmentasi, Grayscale, Foreground), Ekstraksi Fitur Warna-Tekstur GLCM, dan Klasifikasi SVM")
     
     available = get_available_models()
     
@@ -888,129 +889,470 @@ elif page == "🔮 Prediksi":
         )
         st.stop()
     
-    # Upload gambar
-    st.markdown("### 📤 Unggah Gambar")
-    uploaded = st.file_uploader(
-        "Pilih gambar pisang (JPG, PNG):",
-        type=['jpg', 'jpeg', 'png'],
-        accept_multiple_files=False,
+    # 1. Sumber citra: Upload atau Sampel Dataset
+    st.markdown("### 📥 1. Pilih Citra Masukan")
+    input_source = st.radio(
+        "Pilih metode pemilihan citra:",
+        ["📤 Unggah Gambar Baru", "📂 Gunakan Sampel dari Dataset"],
+        horizontal=True,
     )
     
-    if uploaded is not None:
-        # Simpan file sementara
-        temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'artifacts', 'temp')
-        os.makedirs(temp_dir, exist_ok=True)
-        temp_path = os.path.join(temp_dir, uploaded.name)
+    selected_image_path = None
+    input_filename = ""
+    
+    if input_source == "📤 Unggah Gambar Baru":
+        uploaded = st.file_uploader(
+            "Pilih gambar buah pisang (JPG, JPEG, PNG):",
+            type=['jpg', 'jpeg', 'png'],
+            accept_multiple_files=False,
+        )
+        if uploaded is not None:
+            temp_dir = os.path.join(PROJECT_ROOT, 'artifacts', 'temp')
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_path = os.path.join(temp_dir, uploaded.name)
+            with open(temp_path, 'wb') as f:
+                f.write(uploaded.getbuffer())
+            selected_image_path = temp_path
+            input_filename = uploaded.name
+    else:
+        info = load_dataset_cached()
+        if not info['is_valid']:
+            st.error("Dataset tidak valid. Periksa konfigurasi di halaman Dataset.")
+        else:
+            col_s1, col_s2, col_s3 = st.columns([1, 1, 2])
+            with col_s1:
+                splits_list = list(info['splits'].keys())
+                default_split_idx = splits_list.index('test') if 'test' in splits_list else 0
+                ds_split = st.selectbox("Pilih Split Dataset:", splits_list, index=default_split_idx)
+            with col_s2:
+                ds_class = st.selectbox("Pilih Kelas Kematangan:", info['classes'])
+            
+            split_folder = info['splits'][ds_split]
+            cls_folder = os.path.join(split_folder, ds_class)
+            sample_imgs = get_image_paths(cls_folder)
+            
+            if sample_imgs:
+                with col_s3:
+                    s_idx = st.slider("Pilih Sampel Gambar:", 0, min(len(sample_imgs) - 1, 30), 0)
+                    selected_image_path = sample_imgs[s_idx]
+                    input_filename = os.path.basename(selected_image_path)
+            else:
+                st.warning("Tidak ada gambar ditemukan pada folder kelas ini.")
+    
+    if selected_image_path and os.path.exists(selected_image_path):
+        raw_bgr = read_image(selected_image_path)
+        if raw_bgr is None:
+            st.error("Gagal membaca file citra. Pastikan format file didukung.")
+            st.stop()
         
-        with open(temp_path, 'wb') as f:
-            f.write(uploaded.getbuffer())
+        orig_h, orig_w = raw_bgr.shape[:2]
+        raw_rgb = cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB)
         
-        # Tampilkan gambar
-        col1, col2 = st.columns(2)
+        # Preprocessing: Jalankan segmentasi GrabCut & non-segmentasi
+        with st.spinner("Memproses tahapan pemrosesan citra digital..."):
+            prep_seg = preprocess_image(selected_image_path, use_segmentation=True)
+            prep_unseg = preprocess_image(selected_image_path, use_segmentation=False)
+        
+        if prep_seg is None or prep_unseg is None:
+            st.error("Gagal memproses tahapan preprocessing citra.")
+            st.stop()
+        
+        # Komponen Citra Preprocessing
+        resized_rgb = prep_seg['img_rgb']
+        resized_gray = prep_seg['img_gray']
+        seg_mask = prep_seg['mask']
+        seg_success = prep_seg['segmentation_success']
+        mask_vis = (seg_mask.astype(np.uint8) * 255)
+        
+        # Foreground RGB (Latar belakang hitam)
+        fg_rgb = resized_rgb.copy()
+        fg_rgb[~seg_mask] = 0
+        
+        # Kontur Segmentasi
+        contour_img = resized_rgb.copy()
+        contours, _ = cv2.findContours(seg_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(contour_img, contours, -1, (0, 255, 0), 2)
+        
+        # Statistik Luas Foreground
+        fg_pixels = int(np.sum(seg_mask))
+        total_pixels = int(seg_mask.size)
+        fg_percentage = (fg_pixels / total_pixels) * 100.0
+        
+        # ================= TAHAPAN PIPELINE PCD =================
+        st.markdown("---")
+        st.markdown("### 🔄 2. Tahapan Pemrosesan Citra Digital (Pipeline)")
+        st.caption("Alur visualisasi transformasi citra: Dari citra masukan asli, penyeragaman ukuran, konversi keabuan, segmentasi GrabCut, hingga ekstraksi objek foreground.")
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
-            st.markdown("#### 📷 Gambar Asli")
-            pil_img = Image.open(uploaded)
-            st.image(pil_img, use_container_width=True)
-        
+            st.markdown("**1. Citra Asli**")
+            st.image(raw_rgb, use_container_width=True)
+            st.caption(f"📏 {orig_w}×{orig_h} px (RGB Asli)")
+            
         with col2:
-            st.markdown("#### 🔄 Hasil Preprocessing")
-            result = preprocess_image(temp_path)
-            if result:
-                st.image(result['img_rgb'], use_container_width=True)
+            st.markdown("**2. Resize & Padding**")
+            st.image(resized_rgb, use_container_width=True)
+            st.caption(f"📐 {TARGET_SIZE[0]}×{TARGET_SIZE[1]} px (Letterbox)")
+            
+        with col3:
+            st.markdown("**3. Grayscale**")
+            st.image(resized_gray, use_container_width=True)
+            st.caption("⚪ Derajat Keabuan (GLCM)")
+            
+        with col4:
+            st.markdown("**4. Masker Segmentasi**")
+            st.image(mask_vis, use_container_width=True)
+            st.caption(f"✂️ GrabCut Mask ({fg_percentage:.1f}% FG)")
+            
+        with col5:
+            st.markdown("**5. Foreground Pisang**")
+            st.image(fg_rgb, use_container_width=True)
+            st.caption("🍌 Objek Tanpa Background")
+        
+        # ================= DETAIL TAB ANALISIS =================
+        tab_pcd, tab_colors, tab_glcm = st.tabs([
+            "🔍 Detail Segmentasi & Kontur Objek",
+            "🎨 Dekomposisi Ruang Warna (RGB, HSV, CIELAB)",
+            "📐 Analisis Tekstur GLCM (Haralick)",
+        ])
+        
+        with tab_pcd:
+            col_det1, col_det2, col_det3 = st.columns([1, 1, 1.2])
+            with col_det1:
+                st.markdown("**Deteksi Batas Fisik Objek (Kontur Hijau)**")
+                st.image(contour_img, use_container_width=True)
+                st.caption("Garis batas hijau menunjukkan kontur terluar buah pisang hasil segmentasi.")
+            with col_det2:
+                st.markdown("**Foreground Grayscale (Tekstur Buah)**")
+                fg_gray = resized_gray.copy()
+                fg_gray[~seg_mask] = 0
+                st.image(fg_gray, use_container_width=True)
+                st.caption("Hanya piksel pisang dalam derajat keabuan (menghilangkan pengaruh tekstur latar belakang).")
+            with col_det3:
+                st.markdown("**Statistik Pemrosesan Segmentasi**")
+                status_text = "✅ Berhasil (GrabCut konvergen)" if seg_success else "⚠️ Fallback (Citra Penuh)"
+                st.markdown(f"""
+                <div style="background: rgba(76, 175, 80, 0.1); padding: 1.1rem; border-radius: 10px; border-left: 4px solid #4CAF50; border: 1px solid rgba(76, 175, 80, 0.25);">
+                    <p style="margin: 0.35rem 0;"><b>Status Segmentasi:</b> {status_text}</p>
+                    <p style="margin: 0.35rem 0;"><b>Ukuran Target:</b> {TARGET_SIZE[0]} × {TARGET_SIZE[1]} piksel</p>
+                    <p style="margin: 0.35rem 0;"><b>Luas Foreground:</b> {fg_pixels:,} piksel ({fg_percentage:.1f}%)</p>
+                    <p style="margin: 0.35rem 0;"><b>Luas Background:</b> {total_pixels - fg_pixels:,} piksel ({100 - fg_percentage:.1f}%)</p>
+                    <p style="margin: 0.35rem 0;"><b>Algoritma:</b> GrabCut Iterative Graph-Cut & Gaussian Mixture Models (GMM)</p>
+                </div>
+                """, unsafe_allow_html=True)
+        
+        with tab_colors:
+            st.markdown("#### Perbandingan 3 Ruang Warna & Kanal")
+            st.caption("Pemisahan komponen warna sebelum ekstraksi momen statistik (Mean, Std, Median) dan Histogram 8-bin:")
+            
+            c_rgb, c_hsv, c_lab = st.columns(3)
+            with c_rgb:
+                st.markdown("**Ruang Warna RGB**")
+                st.image(prep_seg['img_rgb'], use_container_width=True)
+                st.caption("R (Red), G (Green), B (Blue)")
+            with c_hsv:
+                st.markdown("**Ruang Warna HSV**")
+                hsv_disp = prep_seg['img_hsv'].copy().astype(np.float32)
+                hsv_disp[:, :, 0] /= 180.0
+                hsv_disp[:, :, 1] /= 255.0
+                hsv_disp[:, :, 2] /= 255.0
+                st.image(hsv_disp, use_container_width=True, clamp=True)
+                st.caption("H (Hue: Warna), S (Saturation: Kejenuhan), V (Value: Kecerahan)")
+            with c_lab:
+                st.markdown("**Ruang Warna CIELAB**")
+                lab_disp = prep_seg['img_lab'].copy().astype(np.float32) / 255.0
+                st.image(lab_disp, use_container_width=True, clamp=True)
+                st.caption("L* (Lightness), a* (Hijau-Merah), b* (Biru-Kuning)")
+            
+            # Plot Histogram Kanal
+            st.markdown("##### Histogram Intensitas Warna Objek Pisang (Foreground)")
+            hist_cs = st.selectbox("Pilih Ruang Warna untuk Histogram:", ["RGB", "HSV", "CIELAB"], key="pred_hist_cs")
+            fig_hist, ax_hist = plt.subplots(figsize=(8, 2.5))
+            
+            target_img = prep_seg['img_rgb'] if hist_cs == 'RGB' else (prep_seg['img_hsv'] if hist_cs == 'HSV' else prep_seg['img_lab'])
+            fg_pixels_masked = apply_mask(target_img, seg_mask)
+            
+            if len(fg_pixels_masked) > 0:
+                ch_labels = {'RGB': ['Red', 'Green', 'Blue'], 'HSV': ['Hue', 'Saturation', 'Value'], 'CIELAB': ['L*', 'a*', 'b*']}[hist_cs]
+                ch_colors = {'RGB': ['#E53935', '#43A047', '#1E88E5'], 'HSV': ['#8E24AA', '#FB8C00', '#546E7A'], 'CIELAB': ['#424242', '#00897B', '#FDD835']}[hist_cs]
+                
+                for ch_i, (lbl, col) in enumerate(zip(ch_labels, ch_colors)):
+                    vals = fg_pixels_masked[:, ch_i]
+                    ax_hist.hist(vals, bins=32, color=col, alpha=0.5, label=lbl, density=True)
+                
+                ax_hist.set_xlabel("Nilai Intensitas Kanal")
+                ax_hist.set_ylabel("Densitas Frekuensi")
+                ax_hist.set_title(f"Distribusi Kanal {hist_cs} pada Area Foreground Pisang", fontsize=10, fontweight='bold')
+                ax_hist.legend(loc='upper right')
+                ax_hist.grid(True, linestyle='--', alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig_hist)
+                plt.close(fig_hist)
             else:
-                st.error("Gagal memproses gambar.")
+                st.info("Area foreground kosong untuk perhitungan histogram.")
         
-        # Pilih model
-        st.markdown("### 🤖 Pilih Model")
+        with tab_glcm:
+            st.markdown("#### Matriks & Ekstraksi Fitur Tekstur GLCM")
+            st.caption("Analisis pola spasial hubungan antar pasangan piksel pada derajat keabuan terkuantisasi (32 level):")
+            
+            # Hitung GLCM untuk visualisasi
+            gray_res = cv2.resize(resized_gray, GLCM_RESIZE, interpolation=cv2.INTER_AREA)
+            mask_res = cv2.resize(seg_mask.astype(np.uint8), GLCM_RESIZE, interpolation=cv2.INTER_NEAREST).astype(np.bool_)
+            gray_res_quant = (gray_res / (256 // GLCM_GRAY_LEVELS)).astype(np.uint8)
+            gray_res_quant[~mask_res] = 0
+            
+            from skimage.feature import graycomatrix, graycoprops
+            glcm_mat = graycomatrix(
+                gray_res_quant,
+                distances=[1],
+                angles=[0, np.pi/4, np.pi/2, 3*np.pi/4],
+                levels=GLCM_GRAY_LEVELS,
+                symmetric=True,
+                normed=True
+            )
+            
+            col_glcm1, col_glcm2 = st.columns([1.2, 1])
+            with col_glcm1:
+                st.markdown("**Visualisasi Heatmap GLCM (Jarak d=1, Sudut 0°)**")
+                fig_glcm, ax_glcm = plt.subplots(figsize=(4.5, 3.5))
+                im = ax_glcm.imshow(glcm_mat[:, :, 0, 0], cmap='viridis', interpolation='nearest')
+                ax_glcm.set_title(f"GLCM Matrix ({GLCM_GRAY_LEVELS}×{GLCM_GRAY_LEVELS})", fontsize=10, fontweight='bold')
+                ax_glcm.set_xlabel("Tingkat Abu Piksel J (0-31)")
+                ax_glcm.set_ylabel("Tingkat Abu Piksel I (0-31)")
+                plt.colorbar(im, ax=ax_glcm, fraction=0.046, pad=0.04)
+                plt.tight_layout()
+                st.pyplot(fig_glcm)
+                plt.close(fig_glcm)
+            
+            with col_glcm2:
+                st.markdown("**Nilai 5 Properti Tekstur Haralick**")
+                glcm_vals, glcm_n = extract_glcm_features(resized_gray, mask=seg_mask)
+                glcm_summary = []
+                for prop in GLCM_PROPERTIES:
+                    matching = [v for k, v in zip(glcm_n, glcm_vals) if prop in k]
+                    avg_val = np.mean(matching) if matching else 0.0
+                    glcm_summary.append({
+                        "Properti GLCM": prop.capitalize(),
+                        "Rata-rata Nilai": f"{avg_val:.6f}",
+                    })
+                st.dataframe(pd.DataFrame(glcm_summary), use_container_width=True, hide_index=True)
+                st.caption("Contrast: Kontras lokal | Dissimilarity: Ketidaksamaan linear | Homogeneity: Keseragaman | Energy: Uniformitas | Correlation: Korelasi spasial")
         
-        model_options = {
-            exp_id: f"Eksperimen {exp_id}: {EXPERIMENT_NAMES[exp_id]}"
-            for exp_id in sorted(available.keys())
-        }
+        # ================= PENGATURAN PREDIKSI =================
+        st.markdown("---")
+        st.markdown("### 🤖 3. Konfigurasi & Jalankan Prediksi")
         
-        selected_exp = st.selectbox(
-            "Model untuk prediksi:",
-            options=list(model_options.keys()),
-            format_func=lambda x: model_options[x],
-        )
+        col_m1, col_m2 = st.columns([1.5, 1.5])
+        
+        with col_m1:
+            model_options = {
+                exp_id: f"Eksperimen {exp_id}: {EXPERIMENT_NAMES[exp_id]}"
+                for exp_id in sorted(available.keys())
+            }
+            selected_exp = st.selectbox(
+                "Pilih Model Klasifikasi SVM:",
+                options=list(model_options.keys()),
+                format_func=lambda x: model_options[x],
+            )
+            
+            # Cek metadata model
+            model_info_obj = load_trained_model(selected_exp)
+            model_is_seg = model_info_obj.get('use_segmentation', False) if model_info_obj else False
+            model_cs = model_info_obj.get('color_space', '-') if model_info_obj else '-'
+            model_glcm = model_info_obj.get('use_glcm', False) if model_info_obj else False
+            
+            st.caption(f"ℹ️ Model ini saat training menggunakan: **Ruang Warna: {model_cs}** | **GLCM: {'Ya' if model_glcm else 'Tidak'}** | **Segmentasi: {'Aktif' if model_is_seg else 'Nonaktif (Citra Penuh)'}**")
+        
+        with col_m2:
+            seg_choice = st.radio(
+                "Opsi Masking Segmentasi untuk Prediksi:",
+                [
+                    "Otomatis (Sesuai Konfigurasi Model Saat Training)",
+                    "Paksa Gunakan Segmentasi Foreground",
+                    "Gunakan Citra Penuh (Tanpa Segmentasi)",
+                ],
+                index=0,
+                help="Menentukan apakah fitur diekstrak dari piksel foreground saja atau seluruh citra.",
+            )
+            
+            if seg_choice == "Otomatis (Sesuai Konfigurasi Model Saat Training)":
+                override_seg = None
+            elif seg_choice == "Paksa Gunakan Segmentasi Foreground":
+                override_seg = True
+            else:
+                override_seg = False
         
         col_single, col_all = st.columns(2)
         
+        # Mapping warna & label untuk hasil prediksi
+        ripeness_color_map = {
+            'unripe': {'color': '#2E7D32', 'badge': 'Mentah / Hijau', 'icon': '🍏'},
+            'freshunripe': {'color': '#43A047', 'badge': 'Segar Belum Matang', 'icon': '🍏'},
+            'ripe': {'color': '#F57F17', 'badge': 'Matang Sempurna', 'icon': '🍌'},
+            'freshripe': {'color': '#FBC02D', 'badge': 'Segar Matang', 'icon': '🍌'},
+            'overripe': {'color': '#E65100', 'badge': 'Terlalu Matang', 'icon': '🍂'},
+            'rotten': {'color': '#4E342E', 'badge': 'Busuk / Rusak', 'icon': '🟤'},
+            'Mentah': {'color': '#2E7D32', 'badge': 'Mentah', 'icon': '🍏'},
+            'Matang': {'color': '#F57F17', 'badge': 'Matang', 'icon': '🍌'},
+            'Terlalu Matang': {'color': '#E65100', 'badge': 'Terlalu Matang', 'icon': '🍂'},
+            'Busuk': {'color': '#4E342E', 'badge': 'Busuk', 'icon': '🟤'},
+        }
+        
         with col_single:
             if st.button("🔮 Prediksi dengan Model Terpilih", type="primary", use_container_width=True):
-                with st.spinner("Memproses prediksi..."):
-                    pred = predict_image(temp_path, selected_exp)
+                with st.spinner("Mengekstrak fitur dan menjalankan klasifikasi SVM..."):
+                    pred = predict_image(selected_image_path, selected_exp, use_segmentation=override_seg)
                 
                 if pred and not pred.get('error', False):
                     st.markdown("---")
-                    st.markdown("### 🎯 Hasil Prediksi")
+                    st.markdown("### 🎯 Hasil Prediksi Model")
                     
+                    pred_class = pred['prediction']
+                    style_info = ripeness_color_map.get(str(pred_class), {'color': '#4CAF50', 'badge': str(pred_class), 'icon': '🍌'})
+                    
+                    # Indikator Alur Prediksi
                     st.markdown(f"""
-                    <div class="metric-card" style="border-left-color: #4CAF50;">
-                        <h3>{pred['prediction']}</h3>
-                        <p>{pred['experiment_name']} | {pred['color_space']} | GLCM: {'Ya' if pred['use_glcm'] else 'Tidak'}</p>
+                    <div style="background: rgba(139, 195, 74, 0.12); border: 1px solid rgba(139, 195, 74, 0.35); padding: 0.8rem 1rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.88rem;">
+                        <b>Alur Pemrosesan Aktif:</b><br>
+                        📁 {input_filename} ➔ 🔄 Resize ({TARGET_SIZE[0]}×{TARGET_SIZE[1]}) ➔ ✂️ Segmentasi ({'Aktif' if pred['use_segmentation'] else 'Nonaktif'}) ➔ 🔬 Ekstraksi Fitur ({pred['color_space']} + {'GLCM' if pred['use_glcm'] else 'Tanpa GLCM'}) ➔ 🤖 SVM ({pred['n_features']} fitur) ➔ <b>{pred_class}</b>
                     </div>
                     """, unsafe_allow_html=True)
                     
-                    # Ringkasan fitur
-                    with st.expander("📐 Detail Fitur"):
-                        feat_df = pd.DataFrame({
-                            'Fitur': pred['feature_names'],
-                            'Nilai': [f"{v:.4f}" for v in pred['feature_values']],
-                        })
-                        st.dataframe(feat_df, use_container_width=True, hide_index=True)
+                    # Card Hasil Prediksi
+                    st.markdown(f"""
+                    <div class="metric-card" style="border-left-color: {style_info['color']}; background: rgba(255, 255, 255, 0.04); text-align: left; padding: 1.5rem; border: 1px solid rgba(128, 128, 128, 0.2);">
+                        <span style="font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: #9E9E9E; font-weight: 600;">HASIL KLASIFIKASI KEMATANGAN:</span>
+                        <h2 style="margin: 0.2rem 0; color: {style_info['color']}; font-size: 2.2rem; font-weight: 700;">
+                            {style_info['icon']} {pred_class}
+                        </h2>
+                        <p style="margin: 0.2rem 0; font-size: 1rem;">
+                            <b>Model:</b> {pred['experiment_name']} &nbsp;|&nbsp; 
+                            <b>Ruang Warna:</b> {pred['color_space']} &nbsp;|&nbsp; 
+                            <b>Fitur Tekstur GLCM:</b> {'✅ Ya (Fusi Warna+Tekstur)' if pred['use_glcm'] else '❌ Tidak (Warna Saja)'} &nbsp;|&nbsp; 
+                            <b>Segmentasi:</b> {'✂️ Foreground' if pred['use_segmentation'] else '🖼️ Citra Utuh'}
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
                     
+                    # Decision Values Visualization
                     if pred.get('decision_values'):
-                        with st.expander("📊 Decision Values (bukan probabilitas)"):
-                            st.caption("⚠️ Nilai ini adalah decision function SVM, bukan probabilitas.")
-                            if len(pred['classes']) > 2:
-                                dv_df = pd.DataFrame({
-                                    'Kelas': pred['classes'],
-                                    'Decision Value': [f"{v:.4f}" for v in pred['decision_values']],
-                                })
+                        st.markdown("#### 📊 Nilai Fungsi Keputusan SVM (Decision Values)")
+                        st.caption("Decision Value mengukur jarak margin bertanda sampel terhadap bidang pemisah (hyperplane). Nilai tertinggi menentukan kelas pemenang.")
+                        
+                        classes = pred['classes']
+                        dvals = pred['decision_values']
+                        if not isinstance(dvals, list):
+                            dvals = [dvals]
+                        
+                        if len(classes) == len(dvals):
+                            fig_dv, ax_dv = plt.subplots(figsize=(7, max(2.5, len(classes) * 0.6)))
+                            y_pos = np.arange(len(classes))
+                            bar_colors = [style_info['color'] if c == pred_class else '#B0BEC5' for c in classes]
+                            
+                            bars = ax_dv.barh(y_pos, dvals, color=bar_colors, height=0.55)
+                            ax_dv.set_yticks(y_pos)
+                            ax_dv.set_yticklabels(classes, fontweight='bold', fontsize=10)
+                            ax_dv.axvline(0, color='#78909C', linestyle='--', linewidth=0.8)
+                            ax_dv.set_xlabel("Margin / Decision Value")
+                            ax_dv.set_title("Margin Jarak Terhadap Hyperplane Tiap Kelas", fontsize=10, fontweight='bold')
+                            
+                            for bar, val in zip(bars, dvals):
+                                offset = 0.05 if val >= 0 else -0.15
+                                ax_dv.text(val + offset, bar.get_y() + bar.get_height()/2, f"{val:.3f}", 
+                                           va='center', ha='left' if val >= 0 else 'right', fontsize=9, fontweight='bold')
+                            
+                            plt.tight_layout()
+                            st.pyplot(fig_dv)
+                            plt.close(fig_dv)
+                    
+                    # Detail Fitur yang Diekstrak
+                    with st.expander(f"📐 Detail {pred['n_features']} Fitur yang Diekstrak untuk Prediksi"):
+                        col_f1, col_f2 = st.columns(2)
+                        color_feat_names = [f for f in pred['feature_names'] if 'GLCM' not in f]
+                        color_feat_vals = [pred['feature_values'][i] for i, f in enumerate(pred['feature_names']) if 'GLCM' not in f]
+                        
+                        with col_f1:
+                            st.markdown(f"**Fitur Warna ({pred['color_space']}) - {len(color_feat_names)} Nilai:**")
+                            df_cf = pd.DataFrame({'Fitur': color_feat_names, 'Nilai': [f"{v:.4f}" for v in color_feat_vals]})
+                            st.dataframe(df_cf, use_container_width=True, hide_index=True)
+                            
+                        with col_f2:
+                            glcm_feat_names = [f for f in pred['feature_names'] if 'GLCM' in f]
+                            if glcm_feat_names:
+                                glcm_feat_vals = [pred['feature_values'][i] for i, f in enumerate(pred['feature_names']) if 'GLCM' in f]
+                                st.markdown(f"**Fitur Tekstur (GLCM) - {len(glcm_feat_names)} Nilai:**")
+                                df_gf = pd.DataFrame({'Fitur': glcm_feat_names, 'Nilai': [f"{v:.6f}" for v in glcm_feat_vals]})
+                                st.dataframe(df_gf, use_container_width=True, hide_index=True)
                             else:
-                                dv_df = pd.DataFrame({
-                                    'Decision Value': [f"{pred['decision_values'][0]:.4f}" if isinstance(pred['decision_values'], list) else f"{pred['decision_values']:.4f}"],
-                                })
-                            st.dataframe(dv_df, use_container_width=True, hide_index=True)
+                                st.markdown("**Fitur Tekstur (GLCM):**")
+                                st.info("Model ini hanya menggunakan fitur warna (tidak menyertakan GLCM).")
+                                
                 elif pred:
-                    st.error(pred.get('message', 'Terjadi kesalahan.'))
+                    st.error(pred.get('message', 'Terjadi kesalahan dalam prediksi.'))
         
         with col_all:
-            if st.button("🔮 Prediksi dengan Semua Model", use_container_width=True):
-                with st.spinner("Memproses prediksi semua model..."):
-                    all_preds = predict_all_models(temp_path)
+            if st.button("🔮 Prediksi dengan Semua Model (1 - 6)", use_container_width=True):
+                with st.spinner("Memproses prediksi pada seluruh 6 model eksperimen..."):
+                    all_preds = predict_all_models(selected_image_path, use_segmentation=override_seg)
                 
                 st.markdown("---")
-                st.markdown("### 🎯 Perbandingan Prediksi Semua Model")
+                st.markdown("### 🎯 Perbandingan Hasil Semua Model")
                 
                 pred_rows = []
+                pred_counts = {}
                 for exp_id in sorted(all_preds.keys()):
                     p = all_preds[exp_id]
                     if not p.get('error', False):
+                        pred_val = p['prediction']
+                        pred_counts[pred_val] = pred_counts.get(pred_val, 0) + 1
                         pred_rows.append({
-                            'Eksperimen': p['experiment_name'],
-                            'Prediksi': p['prediction'],
+                            'Exp': exp_id,
+                            'Nama Model': p['experiment_name'],
                             'Ruang Warna': p['color_space'],
-                            'GLCM': '✅' if p['use_glcm'] else '❌',
+                            'GLCM': '✅ Ya' if p['use_glcm'] else '❌ Tidak',
+                            'Prediksi Kematangan': pred_val,
                         })
                     else:
                         pred_rows.append({
-                            'Eksperimen': EXPERIMENT_NAMES.get(exp_id, f'Exp {exp_id}'),
-                            'Prediksi': '⚠️ ' + p.get('message', 'Error')[:50],
+                            'Exp': exp_id,
+                            'Nama Model': EXPERIMENT_NAMES.get(exp_id, f'Exp {exp_id}'),
                             'Ruang Warna': '-',
                             'GLCM': '-',
+                            'Prediksi Kematangan': '⚠️ ' + p.get('message', 'Error')[:40],
                         })
+                
+                # Konsensus / Voting
+                if pred_counts:
+                    majority_class = max(pred_counts, key=pred_counts.get)
+                    majority_count = pred_counts[majority_class]
+                    total_success = sum(pred_counts.values())
+                    st.markdown(f"""
+                    <div class="info-box" style="border-left-color: #2196F3;">
+                        <b>Konsensus Mayoritas Model:</b> <span style="font-size: 1.15rem; font-weight: 700; color: #1565C0;">{majority_class}</span> 
+                        ({majority_count} dari {total_success} model sepakat).
+                    </div>
+                    """, unsafe_allow_html=True)
                 
                 if pred_rows:
                     st.dataframe(pd.DataFrame(pred_rows), use_container_width=True, hide_index=True)
-        
-        # Cleanup temp
-        try:
-            os.remove(temp_path)
-        except Exception:
-            pass
+                    
+                    # Mini bar chart voting
+                    if pred_counts:
+                        fig_vote, ax_vote = plt.subplots(figsize=(6, 2.4))
+                        cls_names = list(pred_counts.keys())
+                        cls_votes = [pred_counts[c] for c in cls_names]
+                        v_colors = [ripeness_color_map.get(str(c), {}).get('color', '#FFA726') for c in cls_names]
+                        ax_vote.bar(cls_names, cls_votes, color=v_colors, width=0.45)
+                        ax_vote.set_ylabel("Jumlah Model")
+                        ax_vote.set_title("Distribusi Keputusan Klasifikasi (6 Model)", fontsize=10, fontweight='bold')
+                        ax_vote.set_yticks(range(0, max(cls_votes) + 2))
+                        for i_v, v_val in enumerate(cls_votes):
+                            ax_vote.text(i_v, v_val + 0.1, str(v_val), ha='center', fontweight='bold', fontsize=9)
+                        ax_vote.grid(axis='y', linestyle='--', alpha=0.3)
+                        plt.tight_layout()
+                        st.pyplot(fig_vote)
+                        plt.close(fig_vote)
 
 
 # ==================== HALAMAN TENTANG ====================

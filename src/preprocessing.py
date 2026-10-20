@@ -77,7 +77,7 @@ def convert_color_space(img_bgr: np.ndarray, color_space: str) -> np.ndarray:
 
 def segment_foreground(
     img_bgr: np.ndarray,
-    iterations: int = 3,
+    iterations: int = 5,
 ) -> Tuple[np.ndarray, bool]:
     """
     Segmentasi foreground menggunakan GrabCut.
@@ -90,9 +90,10 @@ def segment_foreground(
     # Inisialisasi mask
     mask = np.zeros((h, w), np.uint8)
     
-    # Margin untuk bounding box
-    margin = max(5, int(min(h, w) * 0.05))
-    rect = (margin, margin, w - 2 * margin, h - 2 * margin)
+    # Margin untuk bounding box proporsional terhadap dimensi citra
+    margin_x = max(2, int(w * 0.03))
+    margin_y = max(2, int(h * 0.03))
+    rect = (margin_x, margin_y, max(1, w - 2 * margin_x), max(1, h - 2 * margin_y))
     
     bgd_model = np.zeros((1, 65), np.float64)
     fgd_model = np.zeros((1, 65), np.float64)
@@ -109,7 +110,7 @@ def segment_foreground(
         
         # Periksa apakah segmentasi menghasilkan area yang cukup
         fg_ratio = np.sum(fg_mask) / fg_mask.size
-        if fg_ratio < 0.05 or fg_ratio > 0.98:
+        if fg_ratio < 0.03 or fg_ratio > 0.98:
             # Segmentasi gagal: terlalu sedikit atau hampir seluruh gambar
             return np.ones((h, w), dtype=np.bool_), False
         
@@ -136,30 +137,49 @@ def preprocess_image(
     if img is None:
         return None
     
-    # Resize
-    img_resized = resize_image(img, target_size)
+    h, w = img.shape[:2]
+    target_w, target_h = target_size
     
-    # Segmentasi
+    # Hitung skala aspek rasio
+    scale = min(target_w / w, target_h / h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    
+    # Resize menjaga rasio aspek (sebelum diberi padding hitam)
+    img_scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
+    # Segmentasi dijalankan pada citra asli/scaled SEBELUM padding buatan
+    # agar tepi latar belakang asli foto tidak terganggu oleh warna padding hitam
     if use_segmentation:
-        mask, seg_success = segment_foreground(img_resized)
+        mask_scaled, seg_success = segment_foreground(img_scaled)
     else:
-        mask = np.ones(img_resized.shape[:2], dtype=np.bool_)
+        mask_scaled = np.ones((new_h, new_w), dtype=np.bool_)
         seg_success = True
     
+    # Buat canvas target_size dengan padding
+    canvas_bgr = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    canvas_mask = np.zeros((target_h, target_w), dtype=np.bool_)
+    
+    y_offset = (target_h - new_h) // 2
+    x_offset = (target_w - new_w) // 2
+    
+    canvas_bgr[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = img_scaled
+    canvas_mask[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = mask_scaled
+    
     # Konversi warna
-    img_rgb = convert_color_space(img_resized, 'RGB')
-    img_hsv = convert_color_space(img_resized, 'HSV')
-    img_lab = convert_color_space(img_resized, 'CIELAB')
-    img_gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+    img_rgb = convert_color_space(canvas_bgr, 'RGB')
+    img_hsv = convert_color_space(canvas_bgr, 'HSV')
+    img_lab = convert_color_space(canvas_bgr, 'CIELAB')
+    img_gray = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2GRAY)
     
     return {
         'path': path,
-        'img_bgr': img_resized,
+        'img_bgr': canvas_bgr,
         'img_rgb': img_rgb,
         'img_hsv': img_hsv,
         'img_lab': img_lab,
         'img_gray': img_gray,
-        'mask': mask,
+        'mask': canvas_mask,
         'segmentation_success': seg_success,
         'target_size': target_size,
         'use_segmentation': use_segmentation,
